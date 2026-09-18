@@ -1,0 +1,48 @@
+# Build trees
+/build/
+/build-*/
+/out/
+/install/
+/_install/
+/dist/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+*.obj
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.idb
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+*.swp
+
+# Runtime artifacts
+*.log
+*.bbj
+*.bbs
+*.tmp
+crash-*
+core
+core.*
+
+# Local scratch
+/.scratch/
+/tmp/
