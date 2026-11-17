@@ -4,6 +4,7 @@
 
 #include "bandwidth_broker/server.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include "bandwidth_broker/wire.hpp"
 #include <chrono>
@@ -66,6 +67,10 @@ struct CoordinatorServer::Impl final {
   std::atomic<bool> stopping{false};
   std::atomic<std::uint64_t> handled{0};
   std::thread acceptor;
+  // Live connections, guarded by mutex, so that stop() can wake a handler
+  // blocked sending to a peer that stopped reading. A handler removes its
+  // connection and closes the socket under the same lock.
+  std::vector<Connection*> connections;
 };
 
 CoordinatorServer::CoordinatorServer() : impl_(std::make_shared<Impl>()) {}
@@ -82,8 +87,10 @@ void serve_connection(const std::shared_ptr<CoordinatorServer::Impl>& server, st
   bool greeted = false;
 
   const auto finish = [&]() {
-    connection->socket.close();
     std::lock_guard<std::mutex> guard(server->mutex);
+    auto& live = server->connections;
+    live.erase(std::remove(live.begin(), live.end(), connection.get()), live.end());
+    connection->socket.close();
     if (server->active > 0) {
       --server->active;
     }
@@ -485,6 +492,10 @@ Result<std::unique_ptr<CoordinatorServer>> CoordinatorServer::start(Broker& brok
       }
       auto connection = std::make_unique<Connection>();
       connection->socket = accepted.take();
+      {
+        std::lock_guard<std::mutex> guard(impl->mutex);
+        impl->connections.push_back(connection.get());
+      }
       // Handlers are detached and tracked by the active counter: the server
       // never accumulates finished thread objects, and shutdown waits for the
       // counter rather than joining a thread that might need server state.
@@ -516,6 +527,11 @@ void CoordinatorServer::stop() {
   // below is a bounded drain, not a watchdog: it can only elapse if a handler
   // is stuck inside a broker call, in which case shutdown must wait for it.
   std::unique_lock<std::mutex> lock(impl_->mutex);
+  // A handler blocked sending to a peer that stopped reading never sees the
+  // stop flag; interrupting its connection makes that send fail.
+  for (Connection* connection : impl_->connections) {
+    connection->socket.interrupt();
+  }
   impl_->idle.wait(lock, [this]() { return impl_->active == 0; });
 }
 

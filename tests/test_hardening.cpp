@@ -11,6 +11,7 @@
 // the runtime with contradictory, oversized, stale and hostile input.
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <random>
 #include <string>
@@ -18,8 +19,15 @@
 #include <vector>
 
 #include "bandwidth_broker/broker.hpp"
+#include "bandwidth_broker/server.hpp"
+#include "bandwidth_broker/version.hpp"
+#include "bandwidth_broker/wire.hpp"
 #include "support/fixtures.hpp"
 #include "support/test_harness.hpp"
+
+#if defined(_WIN32)
+#include <winsock2.h>
+#endif
 
 using namespace bandwidth_broker;
 using bb_fixture::basic_policy;
@@ -650,3 +658,101 @@ BB_TEST(Adversarial, FencedBootCannotBeRevalidated) {
   BB_REQUIRE(accounting.ok());
   BB_CHECK_EQ(accounting.value().authorized_consumption.bits_per_second(), 0);
 }
+
+BB_TEST(Adversarial, SecondCoordinatorCannotTakeAListeningPort) {
+  Fixture fixture;
+  auto broker = Broker::open(memory_config(fixture));
+  BB_REQUIRE(broker.ok());
+  auto first = CoordinatorServer::start(*broker.value(), ServerOptions{});
+  BB_REQUIRE(first.ok());
+  ServerOptions options;
+  options.port = first.value()->port();
+  auto second = CoordinatorServer::start(*broker.value(), options);
+  // Two coordinators must never share one listening port: the second start fails.
+  const bool second_started = second.ok();
+  if (second_started) {
+    second.value()->stop();
+  }
+  first.value()->stop();
+  BB_CHECK(!second_started);
+}
+
+#if defined(_WIN32)
+BB_TEST(Adversarial, StopReturnsWhileAClientHasStoppedReading) {
+  Fixture fixture;
+  auto broker = Broker::open(memory_config(fixture));
+  BB_REQUIRE(broker.ok());
+  auto server = CoordinatorServer::start(*broker.value(), ServerOptions{});
+  BB_REQUIRE(server.ok());
+
+  HelloRequest hello;
+  hello.publisher = PublisherId::from_value(1);
+  hello.boot = boot_id_from_u64(7, 7);
+  hello.protocol_version = static_cast<std::uint16_t>(BB_PROTOCOL_VERSION);
+  const auto payload = encode_payload(hello);
+  BB_REQUIRE(payload.ok());
+  const auto frame = encode_frame(MessageType::Hello, 1, payload.value());
+  BB_REQUIRE(frame.ok());
+  std::vector<std::uint8_t> batch;
+  for (int index = 0; index < 256; ++index) {
+    batch.insert(batch.end(), frame.value().begin(), frame.value().end());
+  }
+
+  const SOCKET client = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(server.value()->port());
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  const bool connected =
+      client != INVALID_SOCKET &&
+      ::connect(client, reinterpret_cast<const sockaddr*>(&address), static_cast<int>(sizeof(address))) == 0;
+  u_long nonblocking = 1;
+  const bool configured = connected && ::ioctlsocket(client, FIONBIO, &nonblocking) == 0;
+  // The client keeps sending handshakes and never reads a reply, until the
+  // coordinator stops reading because its replies have filled every buffer on
+  // the way: nothing more can be sent for 500 ms.
+  bool saturated = false;
+  std::size_t offset = 0;
+  std::uint64_t sent = 0;
+  while (configured && !saturated && sent < (std::uint64_t{256} << 20)) {
+    const int written = ::send(client, reinterpret_cast<const char*>(batch.data() + offset),
+                               static_cast<int>(batch.size() - offset), 0);
+    if (written > 0) {
+      sent += static_cast<std::uint64_t>(written);
+      offset = (offset + static_cast<std::size_t>(written)) % batch.size();
+      continue;
+    }
+    if (::WSAGetLastError() != WSAEWOULDBLOCK) {
+      break;
+    }
+    fd_set writable;
+    FD_ZERO(&writable);
+    FD_SET(client, &writable);
+    timeval interval{};
+    interval.tv_usec = 500000;
+    saturated = ::select(0, nullptr, &writable, nullptr, &interval) == 0;
+  }
+
+  std::atomic<bool> stopped{false};
+  std::thread stopper([&server, &stopped] {
+    server.value()->stop();
+    stopped.store(true);
+  });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!stopped.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const bool stopped_with_client_connected = stopped.load();
+  if (client != INVALID_SOCKET) {
+    // Releases a coordinator that is still blocked sending to this client.
+    ::closesocket(client);
+  }
+  stopper.join();
+  BB_CHECK(connected);
+  BB_CHECK(configured);
+  BB_CHECK(saturated);
+  // stop() signals every connection to finish; a peer that stopped reading
+  // must not hold it forever.
+  BB_CHECK(stopped_with_client_connected);
+}
+#endif

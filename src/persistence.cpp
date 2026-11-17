@@ -5,11 +5,13 @@
 #include "bandwidth_broker/persistence.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string_view>
 #include <system_error>
+#include <thread>
 
 #include "bandwidth_broker/checksum.hpp"
 #include "bandwidth_broker/numeric.hpp"
@@ -238,6 +240,32 @@ Store::~Store() {
 
 namespace {
 
+// While a reader has the target open (an inspection, an antivirus or indexing
+// scan) the replacing rename fails on Windows until the reader closes the
+// file, so it is retried for a bounded time (about 2 s) instead of failing the
+// write. A directory in the way is not transient and fails at once.
+void replace_file(const std::string& temporary, const std::string& target, std::error_code& error) {
+  for (int attempt = 0;; ++attempt) {
+    fs::rename(temporary, target, error);
+    if (!error) {
+      return;
+    }
+#if defined(_WIN32)
+    // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
+    std::error_code kind;
+    const bool transient = error.category() == std::system_category() &&
+                           (error.value() == 5 || error.value() == 32 || error.value() == 33) &&
+                           !fs::is_directory(target, kind);
+#else
+    const bool transient = false;
+#endif
+    if (!transient || attempt >= 100) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+}
+
 [[nodiscard]] Result<std::uint64_t> read_manifest(const std::string& directory, bool& present) {
   const std::string path = join_path(directory, kManifestName);
   std::error_code error;
@@ -292,7 +320,7 @@ namespace {
   BB_RETURN_IF_ERROR(sync_file(file));
   BB_RETURN_IF_ERROR(close_file(file));
   std::error_code error;
-  fs::rename(temporary, target, error);
+  replace_file(temporary, target, error);
   if (error) {
     fs::remove(temporary, error);
     return io_error("manifest rename failed");
@@ -714,7 +742,7 @@ Status Store::compact(const SnapshotImage& image) {
   BB_RETURN_IF_ERROR(sync_file(file));
   BB_RETURN_IF_ERROR(close_file(file));
   std::error_code error;
-  fs::rename(temporary, target, error);
+  replace_file(temporary, target, error);
   if (error) {
     fs::remove(temporary, error);
     return io_error("snapshot rename failed");

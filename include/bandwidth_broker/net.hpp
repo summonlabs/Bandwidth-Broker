@@ -43,6 +43,9 @@ class BB_API Socket final {
   [[nodiscard]] Result<bool> wait_readable(int poll_milliseconds) const;
 
   void close() noexcept;
+  // Shuts the connection down without closing the handle, so that a send or
+  // receive blocked in another thread returns. The owner still calls close().
+  void interrupt() noexcept;
   [[nodiscard]] bool valid() const noexcept;
   void disable_nagle() noexcept;
 

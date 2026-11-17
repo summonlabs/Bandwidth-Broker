@@ -5,12 +5,16 @@
 // Proof obligations for the coordinator runtime: idempotency, generation-bound
 // authority, release, fencing, durable restart and conservative recovery.
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "bandwidth_broker/broker.hpp"
+#include "bandwidth_broker/persistence.hpp"
 #include "support/fixtures.hpp"
 #include "support/test_harness.hpp"
 
@@ -545,4 +549,45 @@ BB_TEST(Broker, ManyRequestsCloseAccountingAcrossRounds) {
   BB_CHECK_EQ(accounting.value().authorized_consumption.bits_per_second(), 0);
   BB_CHECK_EQ(accounting.value().unallocated.bits_per_second(), 10'000);
   BB_CHECK(accounting.value().validate().empty());
+}
+
+BB_TEST(Store, ManifestReplacementWaitsForAReaderToClose) {
+  TempStore directory("manifest-reader");
+  bool compacted = false;
+  bool reader_opened = false;
+  {
+    auto opened = Store::open(directory.path(), StoreOptions{});
+    BB_REQUIRE(opened.ok());
+    Store& store = *opened.value();
+    BB_REQUIRE(store.recover().ok());
+    RecordHeader header;
+    header.sequence = AuditSequence::from_value(1);
+    header.tick = 1;
+    header.epoch = FabricEpoch::from_value(1);
+    header.coordinator = CoordinatorIncarnation::from_value(1);
+    BB_REQUIRE(store.append(RecordType::CoordinatorBoot, header, std::vector<std::uint8_t>{1, 2, 3}).ok());
+    SnapshotImage image;
+    image.header = header;
+    image.sequence = 1;
+    image.payload = {4, 5, 6};
+    {
+      // Another tool reading the store (an inspection, a scan) holds the
+      // manifest open while compaction replaces it, and closes it shortly after.
+      std::ifstream reader(fs::path(directory.path()) / "MANIFEST", std::ios::binary);
+      reader_opened = reader.is_open();
+      std::thread writer([&store, &image, &compacted] { compacted = store.compact(image).ok(); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      reader.close();
+      writer.join();
+    }
+  }
+  BB_CHECK(reader_opened);
+  // The compaction is not lost because a reader had the manifest open for a moment.
+  BB_CHECK(compacted);
+  auto reopened = Store::open(directory.path(), StoreOptions{});
+  BB_REQUIRE(reopened.ok());
+  auto recovered = reopened.value()->recover();
+  BB_REQUIRE(recovered.ok());
+  BB_CHECK(recovered.value().has_snapshot);
+  BB_CHECK_EQ(recovered.value().snapshot.sequence, std::uint64_t{1});
 }

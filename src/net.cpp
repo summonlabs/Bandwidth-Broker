@@ -86,6 +86,19 @@ void Socket::close() noexcept {
   }
 }
 
+void Socket::interrupt() noexcept {
+  if (handle_ == -1) {
+    return;
+  }
+#if defined(_WIN32)
+  ::shutdown(static_cast<native_socket>(handle_), SD_BOTH);
+  // shutdown() alone does not wake a send or receive already blocked on Windows.
+  ::CancelIoEx(reinterpret_cast<HANDLE>(handle_), nullptr);
+#else
+  ::shutdown(static_cast<native_socket>(handle_), SHUT_RDWR);
+#endif
+}
+
 bool Socket::valid() const noexcept { return handle_ != -1; }
 
 void Socket::disable_nagle() noexcept {
@@ -221,8 +234,16 @@ Result<Listener> Listener::bind_loopback(std::uint16_t port, std::size_t backlog
   if (handle == kInvalidSocket) {
     return make_error<Listener>(ErrorCode::IoError, "cannot create a listening socket");
   }
+#if defined(_WIN32)
+  // SO_REUSEADDR on Windows lets a second socket bind a port that is still
+  // listening; exclusive use makes that second bind fail instead.
+  const int exclusive = 1;
+  ::setsockopt(handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
+               sizeof(exclusive));
+#else
   const char reuse = 1;
   ::setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
 
   sockaddr_in address{};
   address.sin_family = AF_INET;
